@@ -1,0 +1,503 @@
+// ============================================================================
+// KRIMI-DINNER PLATTFORM — DATENMODELL
+// Zielsystem: PostgreSQL (Neon / Supabase), Prisma ORM
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// PLATTFORM-EBENE: Admin & Host Accounts
+// ---------------------------------------------------------------------------
+
+enum PlatformRole {
+  ADMIN
+  HOST
+}
+
+model User {
+  id           String       @id @default(cuid())
+  email        String       @unique
+  passwordHash String
+  name         String
+  role         PlatformRole
+  isActive     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  // Nur relevant für Rolle HOST
+  dinners      Dinner[]
+  auditEvents  AuditEvent[] @relation("ActorUser")
+
+  @@index([role])
+}
+
+model PlatformSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// DINNER (Vorlage — wird NIE durch eine laufende Session verändert)
+// ---------------------------------------------------------------------------
+
+enum DinnerStatus {
+  DRAFT
+  READY
+  ARCHIVED
+}
+
+model Dinner {
+  id          String       @id @default(cuid())
+  hostId      String
+  host        User         @relation(fields: [hostId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+  coverImageUrl String?
+  minPlayers  Int          @default(3)
+  maxPlayers  Int          @default(8)
+  status      DinnerStatus @default(DRAFT)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  characters  Character[]
+  pdfs        Pdf[]
+  chapters    Chapter[]
+  evidences   Evidence[]
+  rounds      Round[]
+  sessions    GameSession[]
+  auditEvents AuditEvent[]
+
+  @@index([hostId])
+}
+
+// ---------------------------------------------------------------------------
+// CHARAKTERE
+// ---------------------------------------------------------------------------
+
+model Character {
+  id          String   @id @default(cuid())
+  dinnerId    String
+  dinner      Dinner   @relation(fields: [dinnerId], references: [id], onDelete: Cascade)
+
+  name        String
+  shortBio    String?
+  colorTag    String?  // rein visuell, z.B. Host-UI Kennzeichnung
+  sortOrder   Int      @default(0)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  pdf                  Pdf?
+  evidenceRestrictions Evidence[]        @relation("EvidenceRestrictedToCharacter")
+  playerAccesses       PlayerAccess[]
+  connections          PlayerConnection[]
+  leavePermissions     PlayerLeavePermission[]
+  hotspotProgress      HotspotProgress[]
+  votes                Vote[]            @relation("VoterCharacter")
+  suspectVotes         Vote[]            @relation("SuspectCharacter")
+
+  @@index([dinnerId])
+}
+
+// ---------------------------------------------------------------------------
+// PDFs (Host lädt fertige Dateien hoch — keine Bearbeitung, nur Analyse)
+// ---------------------------------------------------------------------------
+
+enum PdfKind {
+  CHARACTER
+  HOST
+  EVIDENCE
+}
+
+model Pdf {
+  id           String   @id @default(cuid())
+  dinnerId     String
+  dinner       Dinner   @relation(fields: [dinnerId], references: [id], onDelete: Cascade)
+
+  kind         PdfKind
+
+  // Nur gesetzt wenn kind == CHARACTER (1:1)
+  characterId  String?  @unique
+  character    Character? @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  title        String
+  storageKey   String   // Objekt-Key im geschützten Storage, NIEMALS direkt an Client geben
+  originalFileName String
+  fileSizeBytes Int
+
+  pageCount    Int
+  pageWidthPt  Float
+  pageHeightPt Float
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  chapterAssignments ChapterPageAssignment[]
+  hotspots           Hotspot[]
+  evidence           Evidence?
+
+  @@index([dinnerId])
+  @@index([kind])
+}
+
+// ---------------------------------------------------------------------------
+// KAPITEL — global pro Dinner, aber Seitenzuordnung ist PRO PDF individuell
+// ---------------------------------------------------------------------------
+
+model Chapter {
+  id        String   @id @default(cuid())
+  dinnerId  String
+  dinner    Dinner   @relation(fields: [dinnerId], references: [id], onDelete: Cascade)
+
+  name      String
+  sortOrder Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  pageAssignments ChapterPageAssignment[]
+  evidences       Evidence[]
+  unlocks         ChapterUnlock[]
+
+  @@index([dinnerId])
+  @@unique([dinnerId, sortOrder])
+}
+
+model ChapterPageAssignment {
+  id        String   @id @default(cuid())
+  chapterId String
+  chapter   Chapter  @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+
+  pdfId     String
+  pdf       Pdf      @relation(fields: [pdfId], references: [id], onDelete: Cascade)
+
+  fromPage  Int
+  toPage    Int
+
+  @@unique([chapterId, pdfId])
+  @@index([pdfId])
+}
+
+// ---------------------------------------------------------------------------
+// BEWEISE / GEMEINSAME DOKUMENTE
+// ---------------------------------------------------------------------------
+
+model Evidence {
+  id          String   @id @default(cuid())
+  dinnerId    String
+  dinner      Dinner   @relation(fields: [dinnerId], references: [id], onDelete: Cascade)
+
+  pdfId       String   @unique
+  pdf         Pdf      @relation(fields: [pdfId], references: [id], onDelete: Cascade)
+
+  title       String
+
+  // Automatische Freischaltung zusammen mit einem Kapitel (optional)
+  chapterId   String?
+  chapter     Chapter? @relation(fields: [chapterId], references: [id], onDelete: SetNull)
+
+  // Falls gesetzt: nur für genau diesen Charakter sichtbar (sonst: für alle im Kapitel)
+  restrictedToCharacterId String?
+  restrictedToCharacter   Character? @relation("EvidenceRestrictedToCharacter", fields: [restrictedToCharacterId], references: [id], onDelete: SetNull)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  hotspotLinks Hotspot[]
+  unlocks      EvidenceUnlock[]
+
+  @@index([dinnerId])
+  @@index([chapterId])
+}
+
+// ---------------------------------------------------------------------------
+// OFFENE RUNDEN (Gruppierung von Checkbox-Hotspots zu einer Fortschrittsansicht)
+// ---------------------------------------------------------------------------
+
+model Round {
+  id        String   @id @default(cuid())
+  dinnerId  String
+  dinner    Dinner   @relation(fields: [dinnerId], references: [id], onDelete: Cascade)
+
+  name      String
+  sortOrder Int @default(0)
+
+  hotspots  Hotspot[]
+
+  @@index([dinnerId])
+}
+
+// ---------------------------------------------------------------------------
+// INTERAKTIVE HOTSPOTS (relative Koordinaten zur PDF-Seite, KEINE Pixelwerte)
+// ---------------------------------------------------------------------------
+
+enum HotspotType {
+  CHECKBOX
+  EVIDENCE_LINK
+  NAVIGATION
+}
+
+enum HotspotShape {
+  RECT
+  POLYGON
+}
+
+model Hotspot {
+  id          String       @id @default(cuid())
+  pdfId       String
+  pdf         Pdf          @relation(fields: [pdfId], references: [id], onDelete: Cascade)
+
+  pageNumber  Int
+  type        HotspotType
+  shape       HotspotShape @default(RECT)
+
+  // RECT: { x, y, w, h } in 0..1 relativ zur Seite
+  // POLYGON: { points: [[x,y], ...] } in 0..1 relativ zur Seite
+  geometry    Json
+
+  label       String
+
+  // Nur für type == EVIDENCE_LINK
+  targetEvidenceId String?
+  targetEvidence    Evidence? @relation(fields: [targetEvidenceId], references: [id], onDelete: SetNull)
+
+  // Nur für type == CHECKBOX
+  roundId     String?
+  round       Round?   @relation(fields: [roundId], references: [id], onDelete: SetNull)
+  isRequired  Boolean  @default(true)
+
+  // Nur für type == NAVIGATION (Sprung zu Seite X desselben PDFs)
+  targetPageNumber Int?
+
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  progress    HotspotProgress[]
+
+  @@index([pdfId, pageNumber])
+}
+
+// ---------------------------------------------------------------------------
+// SPIELSITZUNGEN (die eigentliche Durchführung eines Dinners)
+// ---------------------------------------------------------------------------
+
+enum SessionStatus {
+  LOBBY
+  ACTIVE
+  PAUSED
+  VOTING
+  RESOLVED
+  COMPLETED
+}
+
+model GameSession {
+  id          String        @id @default(cuid())
+  dinnerId    String
+  dinner      Dinner        @relation(fields: [dinnerId], references: [id], onDelete: Cascade)
+
+  label       String        // z.B. "Spiel #3"
+  status      SessionStatus @default(LOBBY)
+
+  votingOpen      Boolean   @default(false)
+  resultsVisible  Boolean   @default(false)
+  resolutionUnlocked Boolean @default(false)
+
+  createdAt   DateTime      @default(now())
+  startedAt   DateTime?
+  pausedAt    DateTime?
+  resumedAt   DateTime?
+  completedAt DateTime?
+
+  playerAccesses   PlayerAccess[]
+  connections      PlayerConnection[]
+  leavePermissions PlayerLeavePermission[]
+  chapterUnlocks   ChapterUnlock[]
+  evidenceUnlocks  EvidenceUnlock[]
+  hotspotProgress  HotspotProgress[]
+  votes            Vote[]
+  auditEvents      AuditEvent[]
+
+  @@index([dinnerId])
+}
+
+// Zugangsdaten je Charakter je Session (automatisch generiert)
+model PlayerAccess {
+  id           String      @id @default(cuid())
+  sessionId    String
+  session      GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  characterId  String
+  character    Character   @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  accessCode   String      @unique // öffentlich sichtbarer Login-Code (z.B. "BLACKWOOD-ANNA-7F2K")
+  passwordHash String      // separates, zufällig generiertes Passwort, gehasht
+
+  lastLoginAt  DateTime?
+  createdAt    DateTime    @default(now())
+
+  @@unique([sessionId, characterId])
+}
+
+enum ConnectionStatus {
+  CONNECTED
+  BACKGROUNDED // Tab/App nicht sichtbar, aber (noch) nicht als "verlassen" gewertet
+  LEFT
+  OFFLINE
+}
+
+model PlayerConnection {
+  id          String            @id @default(cuid())
+  sessionId   String
+  session     GameSession       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  characterId String
+  character   Character         @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  status      ConnectionStatus  @default(OFFLINE)
+  lastSeenAt  DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@unique([sessionId, characterId])
+}
+
+model PlayerLeavePermission {
+  id          String      @id @default(cuid())
+  sessionId   String
+  session     GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  characterId String
+  character   Character   @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  allowed     Boolean     @default(false)
+  updatedAt   DateTime    @updatedAt
+
+  @@unique([sessionId, characterId])
+}
+
+model ChapterUnlock {
+  id         String      @id @default(cuid())
+  sessionId  String
+  session    GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  chapterId  String
+  chapter    Chapter     @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+
+  unlockedAt DateTime    @default(now())
+  lockedAt   DateTime?   // gesetzt, wenn Host das Kapitel wieder zurücksperrt
+
+  @@unique([sessionId, chapterId])
+}
+
+model EvidenceUnlock {
+  id         String      @id @default(cuid())
+  sessionId  String
+  session    GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  evidenceId String
+  evidence   Evidence    @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  unlockedAt DateTime    @default(now())
+  lockedAt   DateTime?
+
+  @@unique([sessionId, evidenceId])
+}
+
+model HotspotProgress {
+  id          String      @id @default(cuid())
+  sessionId   String
+  session     GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  characterId String
+  character   Character   @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  hotspotId   String
+  hotspot     Hotspot     @relation(fields: [hotspotId], references: [id], onDelete: Cascade)
+
+  completed   Boolean     @default(false)
+  completedAt DateTime?
+  updatedAt   DateTime    @updatedAt
+
+  @@unique([sessionId, characterId, hotspotId])
+}
+
+model Vote {
+  id          String      @id @default(cuid())
+  sessionId   String
+  session     GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  voterCharacterId   String
+  voterCharacter     Character @relation("VoterCharacter", fields: [voterCharacterId], references: [id], onDelete: Cascade)
+
+  suspectCharacterId String
+  suspectCharacter   Character @relation("SuspectCharacter", fields: [suspectCharacterId], references: [id], onDelete: Cascade)
+
+  createdAt   DateTime    @default(now())
+
+  @@unique([sessionId, voterCharacterId])
+}
+
+// ---------------------------------------------------------------------------
+// AUDIT / HOST-AKTIVITÄTEN
+// ---------------------------------------------------------------------------
+
+enum AuditEventType {
+  DINNER_CREATED
+  DINNER_UPDATED
+  PDF_UPLOADED
+  PDF_REPLACED
+  CHAPTER_CREATED
+  CHAPTER_UPDATED
+  SESSION_CREATED
+  SESSION_STARTED
+  SESSION_PAUSED
+  SESSION_RESUMED
+  SESSION_COMPLETED
+  CHAPTER_UNLOCKED
+  CHAPTER_LOCKED
+  EVIDENCE_UNLOCKED
+  EVIDENCE_LOCKED
+  PLAYER_LEAVE_GRANTED
+  PLAYER_LEAVE_REVOKED
+  PLAYER_MARKED_LEFT
+  PLAYER_RECONNECTED
+  VOTE_CAST
+  RESULTS_REVEALED
+  RESOLUTION_UNLOCKED
+  HOST_LOGIN
+  PLAYER_LOGIN
+  HOST_ACCOUNT_CREATED
+}
+
+model AuditEvent {
+  id              String         @id @default(cuid())
+  type            AuditEventType
+
+  dinnerId        String?
+  dinner          Dinner?        @relation(fields: [dinnerId], references: [id], onDelete: SetNull)
+
+  sessionId       String?
+  session         GameSession?   @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  actorUserId     String?
+  actorUser       User?          @relation("ActorUser", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  actorCharacterId String?
+
+  payload         Json?
+  createdAt       DateTime       @default(now())
+
+  @@index([dinnerId])
+  @@index([sessionId])
+  @@index([type])
+}
